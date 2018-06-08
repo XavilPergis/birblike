@@ -45,31 +45,35 @@ macro_rules! newtype {
 
 use grid::GridX;
 
-#[derive(Debug)]
-pub struct TileGrid(GridX<Entity>);
-#[derive(Debug)]
-pub struct PreviousTileGrid(GridX<Entity>);
+newtype!(TileGrid is GridX<Entity>);
+newtype!(PreviousTileGrid is GridX<Entity>);
+newtype!(TilePos is Vector2<usize>);
+newtype!(TileColor is Vector4<f32>);
+
 #[derive(Debug)]
 pub struct ChangeSet(HashMap<Vector2<usize>, Entity>);
 
-pub struct TilePos(Vector2<usize>);
-pub struct TileColor(Vector4<f32>);
-
 #[derive(Default)]
 pub struct Terrain;
+#[derive(Default)]
+pub struct Dirty;
 
 use specs::prelude::*;
 
 impl Component for TilePos {
-    type Storage = VecStorage<TilePos>;
+    type Storage = VecStorage<Self>;
 }
 
 impl Component for TileColor {
-    type Storage = VecStorage<TileColor>;
+    type Storage = FlaggedStorage<Self, VecStorage<Self>>;
 }
 
 impl Component for Terrain {
-    type Storage = NullStorage<Terrain>;
+    type Storage = NullStorage<Self>;
+}
+
+impl Component for Dirty {
+    type Storage = NullStorage<Self>;
 }
 
 vertex! {
@@ -126,7 +130,7 @@ impl WorldRenderer {
 impl<'a> System<'a> for WorldRenderer {
     type SystemData = (ReadStorage<'a, TilePos>, ReadStorage<'a, TileColor>);
     fn run(&mut self, (pos, color): Self::SystemData) {
-        let env = self.program.environment_mut();
+        let env = self.program.env_mut();
 
         // env.offset.set(Vector2::new(0.0, 0.0));
         // env.scale.set(1.0);
@@ -138,6 +142,7 @@ impl<'a> System<'a> for WorldRenderer {
         env.positions.upload(&*positions, UsageType::DynamicDraw).unwrap();
         env.colors.upload(&*colors, UsageType::DynamicDraw).unwrap();
 
+        // TODO: cleaner rendering solution
         unsafe {
             self.vao.bind();
             self.vbo.bind();
@@ -166,10 +171,11 @@ impl<'a> System<'a> for GridTracker {
         // Write<'a, ChangeSet, PanicHandler>,
         Entities<'a>,
         ReadStorage<'a, TilePos>,
+        ReadStorage<'a, TileColor>,
         ReadStorage<'a, Terrain>,
     );
-    fn run(&mut self, (mut grid, entities, pos, _): Self::SystemData) {
-        let &mut TileGrid(ref mut grid) = &mut *grid;
+    fn run(&mut self, (mut grid, entities, pos, colors, _): Self::SystemData) {
+        // let &mut TileGrid(ref mut grid) = &mut *grid;
 
         if let Some(ref mut prev_grid) = self.previous_grid {
             prev_grid.copy_grid(&grid);
@@ -177,11 +183,14 @@ impl<'a> System<'a> for GridTracker {
             self.previous_grid = Some(grid.clone());
         }
 
-        for (entity, &TilePos(pos)) in (&*entities, &pos).join() {
+        let mut changed = vec![];
+
+        for (entity, &TilePos(pos), &TileColor(color)) in (&*entities, &pos, &colors).join() {
             let (width, height) = grid.dimensions();
             if pos.x < width && pos.y < height {
                 // Position is in bounds, update the reference map.
                 grid[pos] = entity;
+                // if 
             }
         }
 

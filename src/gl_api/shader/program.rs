@@ -42,12 +42,12 @@ pub enum UniformError {
 
 impl<'p> UniformBlockBuilder<'p> {
     pub fn uniform<U: BoundUniform>(&self, name: &str) -> Result<Uniform<U>, UniformError> {
-        self.program.bind();
+        self.program.0.bind();
         unsafe {
             use std::ffi::CString;
             let c_string = CString::new(name).unwrap();
             // UNWRAP: program ID is valid, and the program has been successfully linked
-            let location = gl_call!(GetUniformLocation(self.program.program.id, c_string.as_ptr())).unwrap();
+            let location = gl_call!(GetUniformLocation(self.program.0.id, c_string.as_ptr())).unwrap();
             if location == -1 {
                 Err(UniformError::NameError(c_string.into_string().unwrap_or_default()))
             } else {
@@ -57,7 +57,7 @@ impl<'p> UniformBlockBuilder<'p> {
     }
 
     pub fn shader_storage<A: VertexAttribute>(&mut self, name: &str) -> Result<ShaderStorageBuffer<A>, UniformError> {
-        self.program.bind();
+        self.program.0.bind();
         unsafe {
             use std::ffi::CString;
             let c_string = CString::new(name).unwrap();
@@ -65,15 +65,16 @@ impl<'p> UniformBlockBuilder<'p> {
             let ssbo = ShaderStorageBuffer::new(bind_point);
             ssbo.bind();
             let block_index = gl_call!(GetProgramResourceIndex(
-                self.program.program.id,
+                self.program.0.id,
                 ::gl::SHADER_STORAGE_BLOCK,
                 c_string.as_ptr())
             ).unwrap();
-            // TODO: Unwrap
             if block_index == gl::INVALID_INDEX {
+                // TODO: better error? This returns a useless empty string if
+                // the C string was invalid in some way.
                 Err(UniformError::NameError(c_string.into_string().unwrap_or_default()))
             } else {
-                gl_call!(ShaderStorageBlockBinding(self.program.program.id, block_index, bind_point)).unwrap();
+                gl_call!(ShaderStorageBlockBinding(self.program.0.id, block_index, bind_point)).unwrap();
                 self.buffer_bind_point += 1;
                 Ok(ssbo)
             }
@@ -137,8 +138,6 @@ impl ProgramBuilder {
     }
 }
 
-// builder.build(|builder|);
-
 pub struct Program<I, E> {
     raw: RawLinkedProgram,
     environment: E,
@@ -146,12 +145,12 @@ pub struct Program<I, E> {
 }
 
 impl<In: VertexAttribute, Env> Program<In, Env> {
-    pub fn environment_mut(&mut self) -> &mut Env {
+    pub fn env_mut(&mut self) -> &mut Env {
         &mut self.environment
     }
 
     pub fn bind(&self) {
-        self.raw.bind();
+        self.raw.0.bind();
     }
 
     // TODO: Remove and lift to `Env`
@@ -164,61 +163,8 @@ pub struct RawProgram {
     _marker: ::std::marker::PhantomData<*mut ()>,
 }
 
-#[repr(u32)]
-enum AttributeType {
-    Float = gl::FLOAT,
-    FloatVec2 = gl::FLOAT_VEC2,
-    FloatVec3 = gl::FLOAT_VEC3,
-    FloatVec4 = gl::FLOAT_VEC4,
-    FloatMatrix2 = gl::FLOAT_MAT2,
-    FloatMatrix3 = gl::FLOAT_MAT3,
-    FloatMatrix4 = gl::FLOAT_MAT4,
-    FloatMatrix2x3 = gl::FLOAT_MAT2x3,
-    FloatMatrix2x4 = gl::FLOAT_MAT2x4,
-    FloatMatrix3x2 = gl::FLOAT_MAT3x2,
-    FloatMatrix3x4 = gl::FLOAT_MAT3x4,
-    FloatMatrix4x2 = gl::FLOAT_MAT4x2,
-    FloatMatrix4x3 = gl::FLOAT_MAT4x3,
-    Double = gl::DOUBLE,
-    DoubleVec2 = gl::DOUBLE_VEC2,
-    DoubleVec3 = gl::DOUBLE_VEC3,
-    DoubleVec4 = gl::DOUBLE_VEC4,
-    DoubleMatrix2 = gl::DOUBLE_MAT2,
-    DoubleMatrix3 = gl::DOUBLE_MAT3,
-    DoubleMatrix4 = gl::DOUBLE_MAT4,
-    DoubleMatrix2x3 = gl::DOUBLE_MAT2x3,
-    DoubleMatrix2x4 = gl::DOUBLE_MAT2x4,
-    DoubleMatrix3x2 = gl::DOUBLE_MAT3x2,
-    DoubleMatrix3x4 = gl::DOUBLE_MAT3x4,
-    DoubleMatrix4x2 = gl::DOUBLE_MAT4x2,
-    DoubleMatrix4x3 = gl::DOUBLE_MAT4x3,
-    Int = gl::INT,
-    IntVec2 = gl::INT_VEC2,
-    IntVec3 = gl::INT_VEC3,
-    IntVec4 = gl::INT_VEC4,
-    UnsignedInt = gl::UNSIGNED_INT,
-    UnsignedIntVec2 = gl::UNSIGNED_INT_VEC2,
-    UnsignedIntVec3 = gl::UNSIGNED_INT_VEC3,
-    UnsignedIntVec4 = gl::UNSIGNED_INT_VEC4,
-}
-
-const MAX_NAME_LEN: usize = 64;
-
-struct ActiveAttribute {
-    size: usize,
-    ty: AttributeType,
-    name_len: usize,
-    name: [u8; MAX_NAME_LEN],
-}
-
-impl ActiveAttribute {
-    pub fn name(&self) -> &str {
-        ::std::str::from_utf8(&self.name[..self.name_len]).unwrap()
-    }
-}
-
 impl RawProgram {
-    pub fn new() -> Option<Self> {
+    crate fn new() -> Option<Self> {
         // UNWRAP: this function never sets an error state
         let id = unsafe { gl_call!(CreateProgram()).unwrap() };
         match id {
@@ -230,7 +176,7 @@ impl RawProgram {
         }
     }
 
-    pub fn bind(&self) {
+    crate fn bind(&self) {
         // glUseProgram fails, even though program validation succeeds, and using the program
         // seems to bind it just fine... Smells like a driver bug to me.
         unsafe {
@@ -238,14 +184,14 @@ impl RawProgram {
         }
     }
 
-    pub fn attach_shader(&self, shader: CompiledShader) {
+    crate fn attach_shader(&self, shader: CompiledShader) {
         self.bind();
         unsafe {
             gl_call!(AttachShader(self.id, shader.shader.id)).unwrap();
         }
     }
 
-    pub fn link(self) -> Result<RawLinkedProgram, ProgramError> {
+    crate fn link(self) -> Result<RawLinkedProgram, ProgramError> {
         self.bind();
         unsafe {
             assert!(self.id != 0);
@@ -254,60 +200,12 @@ impl RawProgram {
             gl_call!(ValidateProgram(self.id))?;
             check_program_status(self.id, gl::VALIDATE_STATUS)?;
         }
-        Ok(RawLinkedProgram {
-            program: self,
-            // uniform_cache: HashMap::new(),
-        })
+        Ok(RawLinkedProgram(self))
     }
 }
 
 #[derive(Debug)]
-pub struct RawLinkedProgram {
-    program: RawProgram,
-    // uniform_cache: HashMap<String, UniformLocation>,
-}
-
-impl RawLinkedProgram {
-    // pub fn set_uniform<U: BoundUniform>(&mut self, name: &str, uniform: &U) {
-    //     self.program.bind();
-    //     uniform.set(&if let Some(&location) = self.uniform_cache.get(name) {
-    //         Uniform::new(location)
-    //     } else {
-    //         let location = self.get_uniform_location(name);
-    //         self.uniform_cache.insert(name.into(), location);
-    //         Uniform::new(location)
-    //     });
-    // }
-
-    // void glGetActiveAttrib(GLuint program​, GLuint index​, GLsizei bufSize​,
-    // GLsizei *length​, GLint *size​, GLenum *type​, GLchar *name​);
-    fn active_attrib(&self, index: u32) -> ActiveAttribute {
-        use std::os::raw::c_char;
-        let mut name_buf = [0u8; MAX_NAME_LEN];
-        let mut length = 0;
-        let mut size = 0;
-        let mut ty = 0;
-        // gl_call!(GetActiveAttrib(self.program.id, index, MAX_NAME_LEN as i32, &mut length, &mut size, &mut ty, name_buf[..].as_mut_ptr() as *mut c_char)).unwrap();
-        // ActiveAttribute {
-
-        // }
-        unimplemented!()
-    }
-
-    pub fn bind(&self) {
-        self.program.bind();
-    }
-
-    // fn get_uniform_location(&self, name: &str) -> UniformLocation {
-    //     self.program.bind();
-    //     unsafe {
-    //         use std::ffi::CString;
-    //         let c_string = CString::new(name).unwrap();
-    //         // UNWRAP: program ID is valid, and the program has been successfully linked
-    //         gl_call!(GetUniformLocation(self.program.id, c_string.as_ptr())).unwrap()
-    //     }
-    // }
-}
+pub struct RawLinkedProgram(RawProgram);
 
 #[derive(Debug)]
 pub enum ProgramError {
