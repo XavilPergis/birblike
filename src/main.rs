@@ -27,8 +27,7 @@ use gl_api::shader::program::*;
 use gl_api::shader::shader::*;
 
 macro_rules! newtype {
-    ($name:ident is $type:ty) => {
-        pub struct $name($type);
+    (@DEREF $name:ident is $type:ty) => {
         impl ::std::ops::Deref for $name {
             type Target = $type;
             fn deref(&self) -> &Self::Target {
@@ -41,6 +40,15 @@ macro_rules! newtype {
             }
         }
     };
+    ($name:ident is $type:ty) => {
+        pub struct $name($type);
+        newtype!(@DEREF $name is $type);
+    };
+    (#[$($meta:meta),+] $name:ident is $type:ty) => {
+        #[$($meta),+]
+        pub struct $name($type);
+        newtype!(@DEREF $name is $type);
+    };
 }
 
 use grid::GridX;
@@ -48,13 +56,14 @@ use grid::GridX;
 newtype!(TileGrid is GridX<Entity>);
 newtype!(PreviousTileGrid is GridX<Entity>);
 newtype!(TilePos is Vector2<usize>);
-newtype!(TileColor is Vector4<f32>);
+newtype!(Terrain is Vector2<usize>);
+newtype!(TerrainColor is Vector4<f32>);
+newtype!(#[derive(Default)] ModifiedTerrain is (bool, BitSet));
+newtype!(#[derive(Default)] NewTerrain is (bool, BitSet));
 
 #[derive(Debug)]
 pub struct ChangeSet(HashMap<Vector2<usize>, Entity>);
 
-#[derive(Default)]
-pub struct Terrain;
 #[derive(Default)]
 pub struct Dirty;
 
@@ -64,12 +73,12 @@ impl Component for TilePos {
     type Storage = VecStorage<Self>;
 }
 
-impl Component for TileColor {
+impl Component for TerrainColor {
     type Storage = FlaggedStorage<Self, VecStorage<Self>>;
 }
 
 impl Component for Terrain {
-    type Storage = NullStorage<Self>;
+    type Storage = FlaggedStorage<Self, VecStorage<Self>>;
 }
 
 impl Component for Dirty {
@@ -128,19 +137,51 @@ impl WorldRenderer {
 }
 
 impl<'a> System<'a> for WorldRenderer {
-    type SystemData = (ReadStorage<'a, TilePos>, ReadStorage<'a, TileColor>);
-    fn run(&mut self, (pos, color): Self::SystemData) {
+    type SystemData = (
+        Read<'a, NewTerrain>,
+        Read<'a, ModifiedTerrain>,
+        ReadStorage<'a, Terrain>,
+        ReadStorage<'a, TerrainColor>
+    );
+    fn run(&mut self, (new, modified, pos, color): Self::SystemData) {
+        let &ModifiedTerrain((was_modified, ref modified_set)) = &*modified;
+        let &NewTerrain((was_new, ref new_set)) = &*new;
         let env = self.program.env_mut();
 
         // env.offset.set(Vector2::new(0.0, 0.0));
         // env.scale.set(1.0);
         env.tile_amounts.set(Vector2::new(100, 100));
 
-        let positions = pos.join().map(|&TilePos(val)| val.cast().unwrap()).collect::<Vec<_>>();
-        let colors = color.join().map(|&TileColor(val)| val).collect::<Vec<_>>();
+        // IDEA: After passing some threshold, should we just re-upload the buffers?
+        // New tiles, reupload all the GPU buffers with the new expanded data set
+        if was_new {
+            let positions = pos.join().map(|&Terrain(val)| val.cast().unwrap()).collect::<Vec<Vector2<f32>>>();
+            let colors = color.join().map(|&TerrainColor(val)| val).collect::<Vec<_>>();
 
-        env.positions.upload(&*positions, UsageType::DynamicDraw).unwrap();
-        env.colors.upload(&*colors, UsageType::DynamicDraw).unwrap();
+            self.pos_to_index.clear();
+
+            // Update the pos -> buffer index map; we use this for updating tiles
+            for (index, &pos) in positions.iter().enumerate() {
+                self.pos_to_index.insert(pos.cast().unwrap(), index);
+            }
+
+            env.positions.upload(&*positions, UsageType::DynamicDraw).unwrap();
+            env.colors.upload(&*colors, UsageType::DynamicDraw).unwrap();
+        }
+
+        // Modified data, we gotta map the buffer and update everything.
+        if was_modified {
+        {
+            let mut positions = env.positions.map_mut().unwrap().unwrap();
+            let mut colors = env.colors.map_mut().unwrap().unwrap();
+
+            for (&Terrain(pos), &TerrainColor(color)) in (&pos, &color).join() {
+                let idx = self.pos_to_index[&pos];
+                positions[idx] = pos.cast().unwrap();
+                colors[idx] = color;
+            }
+        }
+        }
 
         // TODO: cleaner rendering solution
         unsafe {
@@ -160,59 +201,60 @@ impl<'a> System<'a> for WorldRenderer {
     }
 }
 
-#[derive(Default)]
 struct GridTracker {
-    previous_grid: Option<GridX<Entity>>,
+    new_id: ReaderId<InsertedFlag>,
+    modified_id: ReaderId<ModifiedFlag>,
 }
 
 impl<'a> System<'a> for GridTracker {
     type SystemData = (
+        Write<'a, NewTerrain>,
+        Write<'a, ModifiedTerrain>,
         Write<'a, TileGrid, PanicHandler>,
-        // Write<'a, ChangeSet, PanicHandler>,
         Entities<'a>,
-        ReadStorage<'a, TilePos>,
-        ReadStorage<'a, TileColor>,
         ReadStorage<'a, Terrain>,
+        ReadStorage<'a, TerrainColor>,
     );
-    fn run(&mut self, (mut grid, entities, pos, colors, _): Self::SystemData) {
-        // let &mut TileGrid(ref mut grid) = &mut *grid;
 
-        if let Some(ref mut prev_grid) = self.previous_grid {
-            prev_grid.copy_grid(&grid);
-        } else {
-            self.previous_grid = Some(grid.clone());
-        }
+    fn run(&mut self, (mut new, mut modified, mut grid, entities, pos, colors): Self::SystemData) {
+        (new.0).1.clear();
+        (modified.0).1.clear();
 
-        let mut changed = vec![];
+        // We need to figure out if there were any insertions/modifications,
+        // and this seems like this is the only way...
+        let inserted_iter = pos.inserted().read(&mut self.new_id);
+        (new.0).0 = inserted_iter.len() > 0;
+        (new.0).1.extend(inserted_iter.map(|item| *item.as_ref()));
 
-        for (entity, &TilePos(pos), &TileColor(color)) in (&*entities, &pos, &colors).join() {
+        pos.populate_modified(&mut self.modified_id, &mut (modified.0).1);
+        // (modified.0).0 = true;
+
+        // let modified_iter = pos.modified().read(&mut self.modified_id);
+        // (modified.0).0 = modified_iter.len() > 0;
+        // (modified.0).1.extend(modified_iter.map(|item| *item.as_ref()));
+
+        for (entity, &Terrain(pos), &TerrainColor(color)) in (&*entities, &pos, &colors).join() {
             let (width, height) = grid.dimensions();
             if pos.x < width && pos.y < height {
                 // Position is in bounds, update the reference map.
                 grid[pos] = entity;
-                // if 
             }
         }
-
-        // Previous grid should always be initalized, so we can unwrap
-        // grid.iter()
-        //     .zip(self.previous_grid.as_ref().unwrap().iter())
-        //     .filter(|(a, b)| a != b);
     }
 }
 
 struct TileDemoSystem;
 
 impl<'a> System<'a> for TileDemoSystem {
-    type SystemData = (Read<'a, TileGrid, PanicHandler>, WriteStorage<'a, TileColor>);
+    type SystemData = (Read<'a, TileGrid, PanicHandler>, WriteStorage<'a, TerrainColor>);
     fn run(&mut self, (grid, mut colors): Self::SystemData) {
-        let &TileGrid(ref grid) = &*grid;
+        let grid = &**grid;
 
         let pos_x = rand::thread_rng().gen_range::<usize>(0, 100);
         let pos_y = rand::thread_rng().gen_range::<usize>(0, 100);
 
         if let Some(color) = colors.get_mut(grid[Vector2::new(pos_x, pos_y)]) {
-            *color = TileColor(Vector4::unit_y());
+            *color = TerrainColor(Vector4::unit_y());
         }
     }
 }
@@ -221,7 +263,7 @@ fn main() {
     let mut events_loop = glutin::EventsLoop::new();
     let window = glutin::WindowBuilder::new()
         .with_title("Birblike")
-        .with_dimensions(1024, 768);
+        .with_dimensions(1000, 1000);
     let context = glutin::ContextBuilder::new()
         .with_gl(GlRequest::Specific(Api::OpenGl, (4, 3)))
         .with_vsync(true);
@@ -257,8 +299,11 @@ fn main() {
     let mut world = World::new();
 
     world.register::<TilePos>();
-    world.register::<TileColor>();
+    world.register::<TerrainColor>();
     world.register::<Terrain>();
+
+    let new_id = world.write_storage::<Terrain>().track_inserted();
+    let modified_id = { let mut ws = world.write_storage::<TerrainColor>(); ws.track_modified() };
 
     let (width, height) = (100, 100);
 
@@ -267,9 +312,8 @@ fn main() {
         for x in 0..width {
             let entity = world
                 .create_entity()
-                .with(Terrain)
-                .with(TilePos(Vector2::new(x, y)))
-                .with(TileColor(Vector4::new(
+                .with(Terrain(Vector2::new(x, y)))
+                .with(TerrainColor(Vector4::new(
                     x as f32 / 100.0,
                     0.0,
                     y as f32 / 100.0,
@@ -281,6 +325,8 @@ fn main() {
     }
 
     world.add_resource(PreviousTileGrid(GridX::from_iter(std::iter::empty(), 0, 0)));
+    world.add_resource(ModifiedTerrain((false, BitSet::new())));
+    world.add_resource(NewTerrain((false, BitSet::new())));
     world.add_resource(TileGrid(GridX::from_iter(
         entity_refs,
         width as usize,
@@ -288,7 +334,7 @@ fn main() {
     )));
 
     let mut dispatcher = DispatcherBuilder::new()
-        .with(GridTracker::default(), "track_grid", &[])
+        .with(GridTracker { new_id, modified_id }, "track_grid", &[])
         .with(TileDemoSystem, "demo", &["track_grid"])
         .with_thread_local(WorldRenderer::new(program))
         .build();
@@ -305,10 +351,6 @@ fn main() {
             _ => (),
         });
 
-        // program.environment_mut().time.set(time);
-
-        // time += 0.01;
-        //
         world.maintain();
         dispatcher.dispatch(&mut world.res);
         gl_window.swap_buffers().unwrap();
