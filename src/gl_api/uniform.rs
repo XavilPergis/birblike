@@ -12,7 +12,7 @@ impl<T: ?Sized> Uniform<T> {
         Uniform { location, _marker: ::std::marker::PhantomData }
     }
 
-    pub fn set(&self, value: T) where T: BoundUniform + Sized {
+    pub fn set(&self, value: &T) where T: BoundUniform {
         value.set(self);
     }
 }

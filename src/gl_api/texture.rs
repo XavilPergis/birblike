@@ -1,3 +1,4 @@
+use image::RgbaImage;
 use image::ImageError;
 use std::cell::Cell;
 use std::ops::Deref;
@@ -65,10 +66,8 @@ impl Texture2D {
         Texture2D { id, texture_slot: Cell::new(0) }
     }
 
-    pub fn source_from_image<P: AsRef<Path>>(&self, path: P) -> TextureResult<()> {
+    pub fn source(&self, image: DynamicImage) -> TextureResult<()> {
         self.bind();
-        let image = image::open(path)?;
-
         #[allow(dead_code)]
         fn tex_image<P, C>(format: GLenum, buffer: &ImageBuffer<P, C>) -> TextureResult<()>
         where P: Pixel + 'static,
@@ -93,6 +92,12 @@ impl Texture2D {
         }
 
         Ok(())
+    }
+
+    pub fn source_from_image<P: AsRef<Path>>(&self, path: P) -> TextureResult<()> {
+        self.bind();
+        let image = image::open(path)?;
+        self.source(image)
     }
 
     fn generate_mipmap(&self) {
